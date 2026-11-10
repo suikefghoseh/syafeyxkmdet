@@ -21,17 +21,32 @@ class World:
         self.wall = float(T0)
         self.games = {}
         self.sorts = {"top-playing-now": [], "top-trending": [], "up-and-coming": []}
+        self.search = {}          # keyword -> universe ids the search lists
+        self.country_sorts = {}   # (sort id, country) -> universe ids in that country's chart
         self.fail_details = False
+        self.fail_search = False
+        self.limit_search = False
+        self.odd_search = False
         self.empty_sorts = False
+        self.listings = []        # every listing the scout read
+        self.asked = []           # every universe id whose stats were requested
 
     def add(self, uid, playing, created=T0 - 400 * 86400, **extra):
         self.games[uid] = {
             "id": uid, "rootPlaceId": uid * 10, "name": f"Game {uid}",
             "description": "  A   test\n game  ", "creator": {"name": "dev", "type": "Group"},
-            "playing": playing, "visits": playing * 1000, "maxPlayers": 10,
+            # An established game: far more lifetime visits than players right now.
+            "playing": playing, "visits": extra.get("visits", playing * 100_000), "maxPlayers": 10,
             "created": _iso(created), "updated": _iso(T0 - 3600),
             "genre_l1": extra.get("g1", "Simulation"), "genre_l2": extra.get("g2", "Tycoon"),
             "favoritedCount": playing * 3,
+        }
+
+    def tile(self, uid):
+        game = self.games[uid]
+        return {
+            "universeId": uid, "rootPlaceId": uid * 10, "name": game["name"],
+            "playerCount": game["playing"], "totalUpVotes": 90, "totalDownVotes": 10,
         }
 
     def sleep(self, seconds):
@@ -69,13 +84,29 @@ class FakeRoblox(Client):
             ]
             return 200, {}, json.dumps({"sorts": sorts, "nextSortsPageToken": ""}).encode()
         if parsed.path.endswith("/get-sort-content"):
-            return 200, {}, json.dumps({"sortId": query["sortId"][0], "games": []}).encode()
+            key = (query["sortId"][0], query["country"][0])
+            if key[1] != "all":
+                world.listings.append(("chart",) + key)
+            games = [world.tile(u) for u in world.country_sorts.get(key, [])]
+            return 200, {}, json.dumps({"sortId": key[0], "games": games}).encode()
+        if parsed.path.endswith("/omni-search"):
+            word = query["searchQuery"][0]
+            world.listings.append(("search", word))
+            if world.fail_search:
+                return 500, {}, b"{}"
+            if world.limit_search:
+                return 429, {"Retry-After": "3"}, b"{}"
+            if world.odd_search:
+                return 200, {}, json.dumps({"searchResults": "moved"}).encode()
+            results = [{"contentGroupType": "Game", "contents": [world.tile(u)]} for u in world.search.get(word, [])]
+            return 200, {}, json.dumps({"searchResults": results, "nextPageToken": ""}).encode()
         ids = [int(x) for x in query["universeIds"][0].split(",")]
         if parsed.path.endswith("/games/votes"):
             data = [{"id": u, "upVotes": 90, "downVotes": 10} for u in ids if u in world.games]
             return 200, {}, json.dumps({"data": data}).encode()
         if parsed.path.endswith("/games"):
             assert len(ids) <= config.DETAILS_BATCH
+            world.asked.extend(ids)
             if world.fail_details:
                 return 500, {}, b"{}"
             return 200, {}, json.dumps({"data": [world.games[u] for u in ids if u in world.games]}).encode()

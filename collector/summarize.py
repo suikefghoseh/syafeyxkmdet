@@ -12,6 +12,7 @@ import sys
 import time
 
 from . import config
+from .early import is_early
 from .groupstats import group_stats
 from .store import Store
 from .timeseries import bucket_stats, interp
@@ -24,6 +25,10 @@ GAME_COLS = [
     "up", "down", "upRef24h", "downRef24h",
     "favs", "favsRef24h",
     "peak7d", "peakAll", "sorts", "entries",
+    # How the scout found the game (empty for chart games), then the early
+    # catch: when it first met the rule, players and visits then, and when it
+    # last met it.
+    "src", "earlyAt", "earlyCcu", "earlyVisits", "earlyLast",
 ]
 
 
@@ -90,6 +95,30 @@ def health_block(status, snaps, latest, first):
         "medianGapMin24h": round(gaps[len(gaps) // 2], 1) if gaps else None,
         "maxGapMin24h": round(gaps[-1], 1) if gaps else None,
         "firstSnapshot": first,
+    }
+
+
+def early_block(status, rows, latest):
+    """The early rule in force, how many games meet it now, and what the scout did."""
+    ccu, visits, src = GAME_COLS.index("ccu"), GAME_COLS.index("visits"), GAME_COLS.index("src")
+    runs = [r for r in status.get("runs") or [] if r.get("ok") and isinstance(r.get("scout"), dict)]
+    recent = [r for r in runs if r.get("at", 0) >= latest - 86400]
+    last = runs[-1]["scout"] if runs else {}
+    return {
+        "minCcu": config.EARLY_MIN_CCU,
+        "minPerThousandVisits": config.EARLY_MIN_RATIO * 1000,
+        "now": sum(1 for r in rows if is_early(r[ccu], r[visits])),
+        "scouted": sum(1 for r in rows if r[src]),
+        "scout": {
+            "lastAt": runs[-1].get("at") if runs else None,
+            "listings": last.get("q"),
+            "listed": last.get("listed"),
+            "checked": last.get("checked"),
+            "added": last.get("added"),
+            "error": last.get("error"),
+            "runs24h": len(recent),
+            "added24h": sum(r["scout"].get("added") or 0 for r in recent),
+        },
     }
 
 
@@ -174,6 +203,7 @@ def build_summary(store, now=None):
         while i0 < len(s["t"]) and s["t"][i0] < week_ago:
             i0 += 1
         peak7d = max(s["ccu"][i0:]) if i0 < len(s["t"]) else ccu
+        caught = st.get("e") or [None, None, None, None]
         rows.append([
             uid, meta.get("n", ""), meta.get("p"), meta.get("g1", ""), meta.get("g2", ""),
             meta.get("cr", ""), created, meta.get("u"), meta.get("fs"),
@@ -189,6 +219,7 @@ def build_summary(store, now=None):
             _ref(s["ft"], s["favs"], ref_at[i24], d24, created, available[i24]),
             peak7d, (st.get("pk") or [ccu])[0],
             sorted(ranks.get(uid, [])), sorted(entries),
+            meta.get("src", ""), *caught,
         ])
         group_rows.append({
             "ccu": ccu,
@@ -226,6 +257,7 @@ def build_summary(store, now=None):
             "newCcu": sum(r["ccu"] for r in group_rows if r["new"]),
         },
         "market": market,
+        "early": early_block(status, rows, latest),
         "sorts": sorts_out,
         "cols": GAME_COLS,
         "games": rows,
@@ -289,6 +321,7 @@ def main(argv=None):
     else:
         print(
             f"summary: {summary['totals']['games']} games, {summary['totals']['ccu']} players, "
+            f"{summary['early']['now']} early catches ({summary['early']['scouted']} games from the scout), "
             f"windows available: {[n for n, a in zip(summary['windows'], summary['available']) if a]}"
         )
     return 0

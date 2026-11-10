@@ -3,6 +3,7 @@
     games.json                  slow-changing facts per game (name, description, dates, genre)
     state.json                  fast-changing bookkeeping per game and per sort
     status.json                 health of the collector and a short run log
+    scout.json                  untracked games the scout has ruled out, and its place in the rotation
     snapshots/YYYY-MM-DD/HHMMSS.json   one file per successful run
     daily/YYYY-MM-DD.json       one rollup per finished day; raw snapshots are deleted after the retention period
     summary.json                precomputed numbers for readers
@@ -74,6 +75,16 @@ class Store:
     def save_state(self, state):
         head = {k: v for k, v in state.items() if k != "games"}
         _write_text(self.root / "state.json", _dump_keyed(head, "games", state["games"]))
+
+    def load_scout(self):
+        cache = self.read("scout.json", {"v": 1})
+        cache.setdefault("cursor", 0)
+        cache.setdefault("seen", {})
+        return cache
+
+    def save_scout(self, cache):
+        head = {k: v for k, v in cache.items() if k != "seen"}
+        _write_text(self.root / "scout.json", _dump_keyed(head, "seen", cache["seen"]))
 
     def load_status(self):
         status = self.read("status.json", {"v": 1})
