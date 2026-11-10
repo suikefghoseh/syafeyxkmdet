@@ -97,6 +97,10 @@ class Client:
             raise DeadlineExceeded(f"needed to wait {seconds:.0f}s with {left:.0f}s left")
         self._sleep(seconds)
 
+    def pause(self, seconds):
+        """Wait before the next request, for callers that want to go slower than the usual pace."""
+        self._wait(seconds)
+
     def _pace(self):
         if self._last_start is not None:
             self._wait(self._last_start + self.min_interval - self._clock())

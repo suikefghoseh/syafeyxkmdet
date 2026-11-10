@@ -68,19 +68,23 @@ EARLY_HOT_DAYS = 3             # polled every run for this long after it last me
 # The charts above only show games that are already big. The scout reads
 # keyword searches and per-country discovery charts, which list small games
 # too, and registers the ones that meet the early rule.
-SCOUT_QUERIES_PER_RUN = 80     # listings read per run
-SCOUT_BUDGET_S = 6 * 60        # the scout stops after this long
-SCOUT_MAX_429 = 3              # ... or after this many rate-limit answers
-SCOUT_MAX_CHECKS = 600         # unknown games whose stats are fetched per run
+SCOUT_CHARTS_PER_RUN = 24      # country charts read per run (all of them every second run)
+SCOUT_SEARCHES_PER_RUN = 40    # keyword searches per run, when the search lets us
+SCOUT_BUDGET_S = 6 * 60        # reading listings stops after this long
+SCOUT_MAX_429 = 3              # listings of one kind that may hit a rate limit before that kind is left for the next run
+SCOUT_SLOW_GAP_S = 10          # extra wait between searches after the search asked us to slow down
+SCOUT_MAX_GAP_S = 60           # the wait doubles on each further rate limit, up to this
+SCOUT_MAX_CHECKS = 300         # unknown games whose stats are fetched per run
 SCOUT_TREND_WORDS = 12         # searches for words taken from current catches' titles
+SCOUT_OFTEN_REPEATS = 5        # times per cycle the pinned and trend words are searched
 SCOUT_FORGET_DAYS = 14         # a rejected game is forgotten once nothing lists it this long
 SCOUT_DROP_DAYS = 14           # a scouted game under EARLY_MIN_CCU this long, never charted, is dropped
 
-# Searched every run: the words developers put in the title of a fresh game.
+# Searched most often: the words developers put in the title of a fresh game.
 SCOUT_PINNED = ["new", "release", "beta", "alpha", "update", "upd", "testing", "demo"]
 
-# Read in rotation, a slice per run: first the discovery charts of the big
-# Roblox countries, then the keywords.
+# Both kinds of listing are read in rotation, a slice per run: the discovery
+# charts of the big Roblox countries, and the keyword searches below.
 SCOUT_SORTS = ["up-and-coming", "top-trending"]
 SCOUT_COUNTRIES = [
     "us", "br", "ph", "id", "mx", "gb", "ru", "de", "fr", "tr", "vn", "th",
