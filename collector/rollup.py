@@ -40,7 +40,7 @@ def build_day(store, day):
             if a <= t < b:
                 s["last"] = (visits, up, down, favs)
 
-    games, total_area = {}, 0.0
+    games, total_area, day_covered = {}, 0.0, 0.0
     for gid, s in series.items():
         if s["last"] is None:
             continue
@@ -48,6 +48,7 @@ def build_day(store, day):
         if means[0] is None:
             continue
         total_area += means[0] * covered[0]
+        day_covered = max(day_covered, covered[0])
         visits, up, down, favs = s["last"]
         games[str(gid)] = [
             round(means[0]),
@@ -60,7 +61,9 @@ def build_day(store, day):
         "day": day,
         "n": len(inside),
         "span": [inside[0]["t"], inside[-1]["t"]],
-        "total": round(total_area / 86400),
+        # Average total players over the part of the day the collector covered.
+        "total": round(total_area / day_covered) if day_covered else None,
+        "covH": round(day_covered / 3600, 1),
         "cols": DAILY_COLS,
         "g": games,
     }
