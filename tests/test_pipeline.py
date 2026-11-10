@@ -26,6 +26,8 @@ class World:
         self.fail_details = False
         self.fail_search = False
         self.limit_search = False
+        self.search_cooldown = 0  # seconds the search wants between two requests
+        self.last_search = None
         self.odd_search = False
         self.empty_sorts = False
         self.listings = []        # every listing the scout read
@@ -48,6 +50,11 @@ class World:
             "universeId": uid, "rootPlaceId": uid * 10, "name": game["name"],
             "playerCount": game["playing"], "totalUpVotes": 90, "totalDownVotes": 10,
         }
+
+    def pin(self, *ids):
+        """List these games under every pinned search word, so every run comes across them."""
+        for word in config.SCOUT_PINNED:
+            self.search[word] = list(ids)
 
     def sleep(self, seconds):
         self.wall += seconds
@@ -96,6 +103,10 @@ class FakeRoblox(Client):
                 return 500, {}, b"{}"
             if world.limit_search:
                 return 429, {"Retry-After": "3"}, b"{}"
+            if world.search_cooldown:
+                if world.last_search is not None and world.wall - world.last_search < world.search_cooldown:
+                    return 429, {"Retry-After": "5"}, b"{}"
+                world.last_search = world.wall
             if world.odd_search:
                 return 200, {}, json.dumps({"searchResults": "moved"}).encode()
             results = [{"contentGroupType": "Game", "contents": [world.tile(u)]} for u in world.search.get(word, [])]

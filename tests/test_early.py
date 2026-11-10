@@ -31,15 +31,24 @@ class ScoutPlanTest(unittest.TestCase):
         self.assertEqual(scout.trend_words(names), ["splash"])
         self.assertEqual(scout.trend_words(names, limit=0), [])
 
-    def test_plan_is_pinned_words_then_trend_words_then_a_slice_of_the_rotation(self):
-        queries, from_rotation = scout.plan(0, ["Splash One", "Splash Two"])
-        pinned = [("search", word) for word in config.SCOUT_PINNED]
-        self.assertEqual(queries[: len(pinned) + 1], pinned + [("search", "splash")])
-        self.assertEqual(len(queries), config.SCOUT_QUERIES_PER_RUN)
-        self.assertEqual(queries[len(pinned) + 1], scout.rotation()[0])
-        self.assertEqual(from_rotation, config.SCOUT_QUERIES_PER_RUN - len(pinned) - 1)
-        wrapped, _ = scout.plan(len(scout.rotation()) - 1, [])
-        self.assertEqual(wrapped[len(pinned) :][:2], [scout.rotation()[-1], scout.rotation()[0]])
+    def test_plan_reads_charts_first_and_continues_each_rotation_where_it_stopped(self):
+        (kind_a, charts, start_a, count_a), (kind_b, searches, start_b, count_b) = scout.plan(
+            {"charts": 50, "searches": 7}, []
+        )
+        self.assertEqual((kind_a, kind_b), ("charts", "searches"))
+        self.assertEqual(charts, scout.charts())
+        self.assertEqual(len(charts), len(config.SCOUT_COUNTRIES) * len(config.SCOUT_SORTS))
+        self.assertEqual((start_a, count_a), (50 % len(charts), config.SCOUT_CHARTS_PER_RUN))
+        self.assertEqual((start_b, count_b), (7, config.SCOUT_SEARCHES_PER_RUN))
+
+    def test_search_cycle_repeats_the_pinned_and_trend_words(self):
+        cycle = scout.searches(["Splash One", "Splash Two"])
+        words = [query[1] for query in cycle]
+        self.assertEqual(words[: len(config.SCOUT_PINNED) + 1], config.SCOUT_PINNED + ["splash"])
+        for word in config.SCOUT_PINNED + ["splash"]:
+            self.assertEqual(words.count(word), config.SCOUT_OFTEN_REPEATS)
+        for word in config.SCOUT_KEYWORDS:
+            self.assertEqual(words.count(word), 1)
 
     def test_labels(self):
         self.assertEqual(scout.label(("search", "release")), "search:release")
@@ -86,12 +95,14 @@ class ScoutTest(unittest.TestCase):
         self.assertEqual(summary["early"]["scouted"], 1)
         self.assertEqual(summary["early"]["minCcu"], config.EARLY_MIN_CCU)
         self.assertEqual(summary["early"]["scout"]["added24h"], 1)
-        self.assertEqual(summary["early"]["scout"]["listings"], config.SCOUT_QUERIES_PER_RUN)
+        self.assertEqual(
+            summary["early"]["scout"]["listings"], config.SCOUT_CHARTS_PER_RUN + config.SCOUT_SEARCHES_PER_RUN
+        )
 
     def test_ruled_out_game_is_only_asked_about_again_once_it_could_pass(self):
         world, store = self.world, self.store
         world.add(901, 500, visits=5_000_000)
-        world.search["release"] = [901]
+        world.pin(901)
         run(store, world)
         world.at(1800)
         run(store, world)
@@ -102,7 +113,7 @@ class ScoutTest(unittest.TestCase):
         world.games[901].update(playing=6_000, visits=5_050_000)  # 1.2 players per 1,000 visits
         run(store, world)
         self.assertEqual(world.asked.count(901), 2)
-        self.assertEqual(store.load_games()["901"]["src"], "search:release")
+        self.assertTrue(store.load_games()["901"]["src"].startswith("search:"))
         self.assertNotIn("901", store.load_scout()["seen"])
 
     def test_country_charts_are_scouted_too(self):
@@ -115,14 +126,17 @@ class ScoutTest(unittest.TestCase):
 
     def test_every_listing_gets_its_turn(self):
         world, store = self.world, self.store
-        per_run = config.SCOUT_QUERIES_PER_RUN - len(config.SCOUT_PINNED)
-        runs = math.ceil(len(scout.rotation()) / per_run)
+        cycle = scout.searches([])
+        runs = math.ceil(len(cycle) / config.SCOUT_SEARCHES_PER_RUN)
         for i in range(runs):
             world.at(i * 1800)
             run(store, world)
-        self.assertEqual(set(scout.rotation()) - set(world.listings), set())
+        self.assertEqual(set(scout.charts()) - set(world.listings), set())
+        self.assertEqual(set(cycle) - set(world.listings), set())
         for word in config.SCOUT_PINNED:
-            self.assertEqual(world.listings.count(("search", word)), runs)
+            self.assertGreaterEqual(world.listings.count(("search", word)), config.SCOUT_OFTEN_REPEATS)
+        # Charts come before searches in every run.
+        self.assertEqual({q[0] for q in world.listings[: config.SCOUT_CHARTS_PER_RUN]}, {"chart"})
 
     def test_catch_is_recorded_once_and_followed_as_the_game_grows(self):
         world, store = self.world, self.store
@@ -172,12 +186,13 @@ class ScoutTest(unittest.TestCase):
     def test_scout_trouble_never_costs_the_snapshot(self):
         world, store = self.world, self.store
         world.add(900, 500, visits=3_000)
-        world.search["new"] = [900]
+        world.pin(900)
         world.fail_search = True
         result = run(store, world)
         self.assertFalse(result["partial"])
         self.assertEqual(result["scout"]["added"], 0)
-        self.assertLess(result["scout"]["q"], config.SCOUT_QUERIES_PER_RUN)  # gave up on its time budget
+        self.assertEqual(result["scout"]["charts"], config.SCOUT_CHARTS_PER_RUN)
+        self.assertLess(result["scout"]["searches"], config.SCOUT_SEARCHES_PER_RUN)  # ran out of its time budget
         self.assertEqual(len(store.load_snapshots()), 1)
 
         world.at(1800)
@@ -187,15 +202,53 @@ class ScoutTest(unittest.TestCase):
         self.assertEqual(len(store.load_snapshots()), 2)
 
         world.at(3600)
-        world.odd_search, world.limit_search = False, True
-        asked = len(world.listings)
-        result = run(store, world)
-        self.assertEqual(len(set(world.listings[asked:])), 1)  # backs off after the first rate-limited listing
-        self.assertEqual(len(store.load_snapshots()), 3)
-
-        world.at(5400)
-        world.limit_search = False
+        world.odd_search = False
         self.assertEqual(run(store, world)["scout"]["added"], 1)
+
+    def test_a_rate_limited_search_does_not_stop_the_charts(self):
+        world, store = self.world, self.store
+        world.add(900, 500, visits=3_000)
+        world.add(910, 300, visits=40_000)
+        world.pin(900)
+        world.country_sorts[("up-and-coming", "us")] = [910]
+        world.limit_search = True
+        result = run(store, world)
+        self.assertEqual(result["scout"]["charts"], config.SCOUT_CHARTS_PER_RUN)
+        self.assertEqual(result["scout"]["searches"], config.SCOUT_MAX_429)   # gave the search a rest
+        self.assertEqual(result["scout"]["limited"], ["searches"])
+        self.assertEqual(result["scout"]["added"], 1)
+        self.assertIn("910", store.load_games())
+        self.assertNotIn("900", store.load_games())
+        self.assertFalse(result["partial"])
+
+    def test_searches_slow_down_to_the_pace_the_search_allows(self):
+        world, store = self.world, self.store
+        world.search_cooldown = 25      # the search answers one request every 25 seconds
+        first = run(store, world)["scout"]
+        self.assertEqual(first["limited"], ["searches"])
+        self.assertGreaterEqual(store.load_scout()["gap"], config.SCOUT_SLOW_GAP_S)
+        done = []
+        for i in range(1, 5):
+            world.at(i * 1800)
+            done.append(run(store, world)["scout"])
+        # It settles on a gap the search accepts instead of giving up after a few tries.
+        self.assertNotIn("limited", done[-1])
+        self.assertGreater(done[-1]["searches"], first["searches"])
+        self.assertLessEqual(store.load_scout()["gap"], config.SCOUT_MAX_GAP_S)
+        # The rotation keeps moving at whatever pace is allowed.
+        self.assertEqual(
+            store.load_scout()["searches"],
+            (first["searches"] + sum(s["searches"] for s in done)) % len(scout.searches([])),
+        )
+
+        world.search_cooldown = 0       # the limit is lifted: the pace recovers run by run
+        gaps = []
+        for i in range(5, 13):
+            world.at(i * 1800)
+            run(store, world)
+            gaps.append(store.load_scout()["gap"])
+        self.assertEqual(gaps, sorted(gaps, reverse=True))
+        self.assertLess(gaps[-1], config.SCOUT_SLOW_GAP_S)
 
     def test_faded_scout_games_are_dropped_but_charted_ones_stay(self):
         world, store = self.world, self.store

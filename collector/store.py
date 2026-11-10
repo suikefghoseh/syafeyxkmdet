@@ -78,7 +78,10 @@ class Store:
 
     def load_scout(self):
         cache = self.read("scout.json", {"v": 1})
-        cache.setdefault("cursor", 0)
+        cache.pop("cursor", None)        # the first version kept one place for both kinds of listing
+        cache.setdefault("charts", 0)    # place in the rotation of country charts
+        cache.setdefault("searches", 0)  # place in the rotation of searches
+        cache.setdefault("gap", 0)       # extra seconds between searches that the search last tolerated
         cache.setdefault("seen", {})
         return cache
 
