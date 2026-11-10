@@ -1,4 +1,4 @@
-"""One collection run: read the explore sorts, then poll every tracked game.
+"""One collection run: read the explore sorts, poll every tracked game, then scout.
 
 Usage: python -m collector.collect --data DIR
 
@@ -13,8 +13,9 @@ import sys
 import time
 import uuid
 
-from . import config
+from . import config, scout
 from .client import Client, DeadlineExceeded, HttpError
+from .early import is_early
 from .store import SNAPSHOT_COLS, Store
 
 _TIME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
@@ -118,6 +119,9 @@ def is_hot(meta, st, now):
         return True
     if now - meta.get("fs", now) <= config.HOT_FIRST_SEEN_DAYS * 86400:
         return True
+    caught = st.get("e")
+    if caught and now - caught[3] <= config.EARLY_HOT_DAYS * 86400:
+        return True
     created = meta.get("c")
     return created is not None and now - created <= config.HOT_NEW_DAYS * 86400
 
@@ -165,22 +169,27 @@ def fetch_stats(client, ids, log=print):
             if isinstance(item.get("id"), int) and isinstance(item.get("playing"), int):
                 details[str(item["id"])] = item
 
-    for batch in chunks([g for g in ids if g in details], config.VOTES_BATCH):
-        if stopped:
-            break
+    if not stopped:
+        votes = fetch_votes(client, [g for g in ids if g in details], log)
+    return details, votes, failed
+
+
+def fetch_votes(client, ids, log=print):
+    """{id: (up, down)} for as many of the ids as could be read."""
+    votes = {}
+    for batch in chunks(ids, config.VOTES_BATCH):
         try:
             data = client.get_json(config.GAMES_API + "/games/votes", {"universeIds": ",".join(batch)})
         except DeadlineExceeded as error:
             log(f"  stopping early: {error}")
-            stopped = True
-            continue
+            break
         except HttpError as error:
             log(f"  votes batch failed: {error}")
             continue
         for item in data.get("data") or []:
             if isinstance(item.get("id"), int):
                 votes[str(item["id"])] = (item.get("upVotes"), item.get("downVotes"))
-    return details, votes, failed
+    return votes
 
 
 def apply_details(meta, item):
@@ -197,6 +206,33 @@ def apply_details(meta, item):
     meta["mp"] = item.get("maxPlayers")
 
 
+def run_scout(client, games, gstate, cache, now, log=print):
+    """The scout must never cost the run its snapshot, so any error ends only the scout."""
+    try:
+        return scout.run(client, games, gstate, cache, now, log)
+    except Exception as error:  # an unexpected answer shape, for example
+        log(f"  scout failed: {type(error).__name__}: {error}")
+        return {}, {"error": f"{type(error).__name__}: {error}"[:200]}
+
+
+def drop_faded(games, gstate, now):
+    """Forget scouted games that never reached a chart and have gone quiet.
+
+    Without this the registry would fill up with every small game that ever
+    had a good hour. A game that later takes off again is simply found again.
+    """
+    dropped = []
+    for gid in [g for g, meta in games.items() if meta.get("src")]:
+        st = gstate.get(gid, {})
+        if st.get("s"):
+            continue  # it reached a chart, so it stays like any chart game
+        if now - st.get("la", games[gid].get("fs", now)) > config.SCOUT_DROP_DAYS * 86400:
+            del games[gid]
+            gstate.pop(gid, None)
+            dropped.append(gid)
+    return dropped
+
+
 # --------------------------------------------------------------------------
 # The run
 # --------------------------------------------------------------------------
@@ -204,6 +240,7 @@ def collect_once(store, client, now=time.time, log=print):
     """Do one run. Returns a small result dict; raises RunFailed on failure."""
     games = store.load_games()
     state = store.load_state()
+    cache = store.load_scout()
     gstate = state["games"]
 
     started = int(now())
@@ -237,6 +274,18 @@ def collect_once(store, client, now=time.time, log=print):
     if not details or sum(item["playing"] for item in details.values()) <= 0:
         raise RunFailed("stats response was empty")
 
+    # Scout: untracked games that meet the early rule join this same snapshot.
+    # It runs after the regular poll so that it can never crowd it out.
+    found, scouted = run_scout(client, games, gstate, cache, now, log)
+    for gid, (item, source) in found.items():
+        games[gid] = {"n": item.get("name") or "", "p": item.get("rootPlaceId"), "fs": started, "src": source}
+        gstate[gid] = {}
+        details[gid] = item
+        wanted.append(gid)
+    if found:
+        votes.update(fetch_votes(client, list(found), log))
+    log(f"scout: {scouted}")
+
     # Snapshot rows.
     rows = []
     for gid in wanted:
@@ -265,6 +314,15 @@ def collect_once(store, client, now=time.time, log=print):
         peak = st.get("pk")
         if not peak or item["playing"] > peak[0]:
             st["pk"] = [item["playing"], snapshot_time]
+        # Early catch: [first caught, players then, visits then, last time it met the rule].
+        if is_early(item["playing"], item.get("visits")):
+            caught = st.get("e")
+            if caught is None:
+                st["e"] = [snapshot_time, item["playing"], item.get("visits") or 0, snapshot_time]
+            else:
+                caught[3] = snapshot_time
+        if games[gid].get("src") and item["playing"] >= config.EARLY_MIN_CCU:
+            st["la"] = snapshot_time
 
     # Sort membership: [first seen, last seen, last entry, best rank].
     # An entry is a sighting after REENTRY_GAP_S of absence. The first time a
@@ -302,9 +360,13 @@ def collect_once(store, client, now=time.time, log=print):
     }
     if state["first"] is None:
         state["first"] = snapshot_time
+    dropped = drop_faded(games, gstate, snapshot_time)
+    if dropped:
+        scouted["dropped"] = len(dropped)
     name = store.write_snapshot(snapshot)
     store.save_games(games)
     store.save_state(state)
+    store.save_scout(cache)
     log(f"saved {name}: {len(rows)} games, partial={partial}")
     return {
         "t": snapshot_time,
@@ -313,6 +375,7 @@ def collect_once(store, client, now=time.time, log=print):
         "partial": partial,
         "failed": len(failed),
         "ccu": sum(row[1] for row in rows),
+        "scout": scouted,
     }
 
 
@@ -354,6 +417,7 @@ def main(argv=None):
         "games": result.get("games", 0),
         "new": result.get("new", 0),
         "partial": bool(result.get("partial")),
+        "scout": result.get("scout"),
         "requests": client.requests,
         "retries": client.retries,
         "r429": client.rate_limited,
