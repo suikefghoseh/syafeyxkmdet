@@ -1,0 +1,97 @@
+name: collect
+
+on:
+  schedule:
+    # Every 30 minutes, off the hour (the top of the hour is the busiest time for scheduled runs).
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # push snapshots to the data branch
+  actions: write  # re-enable this workflow so the 60-day inactivity rule never pauses it
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      REPO_URL: https://github.com/${{ github.repository }}.git
+    steps:
+      - name: Get code and data
+        run: |
+          git config --global credential.helper '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN}"; }; f'
+          git config --global advice.detachedHead false
+          git init -q code
+          git -C code fetch -q --depth 1 "$REPO_URL" "$GITHUB_SHA"
+          git -C code checkout -q FETCH_HEAD
+          if git ls-remote --exit-code --heads "$REPO_URL" data >/dev/null 2>&1; then
+            git clone -q --depth 1 --branch data "$REPO_URL" data
+          else
+            git init -q -b data data
+            git -C data remote add origin "$REPO_URL"
+          fi
+
+      - name: Test
+        working-directory: code
+        run: python3 -m unittest discover -s tests -t . 2>&1 | tail -4
+
+      - name: Collect
+        id: collect
+        working-directory: code
+        run: |
+          set +e
+          python3 -m collector.collect --data ../data
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Roll up and summarize
+        id: rollup
+        working-directory: code
+        run: |
+          python3 -m collector.rollup --data ../data
+          python3 -m collector.summarize --data ../data
+
+      - name: Save
+        working-directory: data
+        env:
+          ROLLED: ${{ steps.rollup.outputs.rolled }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to save"
+            exit 0
+          fi
+          stamp="$(date -u +%Y-%m-%dT%H:%MZ)"
+          if [ "$ROLLED" = "true" ]; then
+            # Once a day the branch history is replaced by a single commit, so the
+            # repository stays small no matter how long the collector runs.
+            git checkout -q --orphan fresh
+            git add -A
+            git commit -q -m "data: $stamp (history squashed)"
+            git push -q --force origin HEAD:data
+          else
+            git commit -q -m "data: $stamp"
+            git push -q origin HEAD:data
+          fi
+          du -sh --exclude=.git . | sed 's/^/data size: /'
+
+      - name: Keep the schedule alive
+        if: steps.rollup.outputs.rolled == 'true'
+        run: |
+          curl -fsS -o /dev/null -X PUT \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/collect.yml/enable" || true
+
+      - name: Flag a failed run
+        if: steps.collect.outputs.exit != '0'
+        run: |
+          echo "::error::Collection failed, no snapshot was saved. Details are in status.json on the data branch."
+          exit 1
