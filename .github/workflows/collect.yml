@@ -2,9 +2,16 @@ name: collect
 
 on:
   schedule:
-    # Every 30 minutes, off the hour (the top of the hour is the busiest time for scheduled runs).
-    - cron: "7,37 * * * *"
+    # Six slots an hour, off the hour. GitHub starts scheduled runs late and drops many of them: with two slots an
+    # hour only one ever ran, and on 2026-11-18 none did for over five hours. So there are more slots than wanted
+    # runs, and the step "Decide whether to collect" ends a scheduled run at once unless the last snapshot is at
+    # least 23 minutes old. That keeps the pace at one collection every 30 minutes at most.
+    - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch:
+  push:
+    # New collector code or a new workflow is tried at once.
+    branches-ignore: [data]
+    paths: ["collector/**", ".github/workflows/collect.yml"]
 
 permissions:
   contents: write # push snapshots to the data branch
@@ -36,12 +43,29 @@ jobs:
             git -C data remote add origin "$REPO_URL"
           fi
 
+      - name: Decide whether to collect
+        id: gate
+        run: |
+          # A scheduled run collects only when the last snapshot is 23 minutes old and nothing was tried in the last
+          # 15 (so a failing run is not repeated every 10 minutes). A manual run or a push of new code always collects.
+          ages=$(python3 -c "import json,time; s=json.load(open('data/status.json')); n=time.time(); print(int(n-(s.get('lastOk') or 0)), int(n-(s.get('lastAttempt') or 0)))" 2>/dev/null || echo "999999 999999")
+          set -- $ages
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && { [ "$1" -lt 1380 ] || [ "$2" -lt 900 ]; }; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skipping: last snapshot $1 s ago, last attempt $2 s ago"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "collecting ($GITHUB_EVENT_NAME): last snapshot $1 s ago, last attempt $2 s ago"
+          fi
+
       - name: Test
+        if: steps.gate.outputs.run == 'true'
         working-directory: code
         run: python3 -m unittest discover -s tests -t . 2>&1 | tail -4
 
       - name: Collect
         id: collect
+        if: steps.gate.outputs.run == 'true'
         working-directory: code
         run: |
           set +e
@@ -51,12 +75,14 @@ jobs:
 
       - name: Roll up and summarize
         id: rollup
+        if: steps.gate.outputs.run == 'true'
         working-directory: code
         run: |
           python3 -m collector.rollup --data ../data
           python3 -m collector.summarize --data ../data
 
       - name: Save
+        if: steps.gate.outputs.run == 'true'
         working-directory: data
         env:
           ROLLED: ${{ steps.rollup.outputs.rolled }}
@@ -91,7 +117,7 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/collect.yml/enable" || true
 
       - name: Flag a failed run
-        if: steps.collect.outputs.exit != '0'
+        if: steps.gate.outputs.run == 'true' && steps.collect.outputs.exit != '0'
         run: |
           echo "::error::Collection failed, no snapshot was saved. Details are in status.json on the data branch."
           exit 1
